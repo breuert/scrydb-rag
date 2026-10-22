@@ -1,1 +1,152 @@
-# scrydb_rag
+# scrydb-rag
+
+Retrieval-augmented generation with [scrydb](https://github.com/breuert/scrydb) as retrieval
+component and the models of the [KI:connect.nrw](https://chat.kiconnect.nrw) platform (THKI) as
+language models. The retrieval runs over the BEIR indices of
+[scrydb-eval](https://huggingface.co/datasets/breuert/scrydb-eval), single SQLite files with
+the documents, an FTS5 index, and Qwen3-Embedding-8B embeddings at three precisions.
+
+```text
+question ──► scrydb: BM25 (default) | vector search | RRF ──► top-k passages ──► GPT-OSS 120B ──► answer with [n] citations
+               ▲ query embedding: Qwen3-Embedding-8B (THKI), or the stored one of a benchmark query
+```
+
+- **Interactive mode** (`repl`) and one-shot questions (`ask`) for arbitrary questions
+- **Benchmark** (`bench`) over all queries of a test collection, resumable, with the retrieval
+  evaluated against the qrels
+- **Evaluation with DeepEval** (`evaluate`), judged by a THKI model as custom DeepEval model
+
+## Setup
+
+```bash
+uv sync
+echo "LLM_API_KEY=<your KI:connect.nrw API key>" >> .env
+uv run scrydb-rag download nfcorpus         # index (191 MB) and qrels from Hugging Face
+```
+
+The `sqlite3` module of the Python has to support loading extensions, which uv's Python builds
+and Homebrew's do (macOS's system Python does not, see scrydb's README). `scrydb-rag datasets`
+lists the eight datasets and which are downloaded; they range from 191 MB (NFCorpus) to 11.5 GB
+(Quora). Instead of a dataset name, `ask`, `repl`, and `bench` also take the path of a scrydb
+index (`bench` then needs `--qrels`).
+
+## Usage
+
+```bash
+uv run scrydb-rag ask nfcorpus "Do statins cause breast cancer?"
+uv run scrydb-rag ask nfcorpus --mode hybrid --precision float -k 10 --passages "How does fasting affect autophagy?"
+uv run scrydb-rag repl scifact --mode semantic --rerank float
+
+uv run scrydb-rag bench nfcorpus                     # all 323 test queries, BM25, k=5, GPT-OSS 120B
+uv run scrydb-rag bench nfcorpus --limit 20 --evaluate
+uv run scrydb-rag evaluate results/nfcorpus/bm25-k5-openai-gpt-oss-120b --judge qwen3.5
+```
+
+`scrydb-rag COMMAND --help` lists all options. Models can be given by a unique part of their
+ID (e.g., `-m mistral`, `--judge gpt5.5`); `-p KEY=VALUE` passes request parameters, e.g.,
+`-p reasoning_effort=low`.
+
+### Retrieval
+
+The options are scrydb's search vocabulary; the default is BM25 over FTS5.
+
+| Option | Values | Default |
+| :-- | :-- | :-- |
+| `--mode` | `lexical` (BM25), `semantic` (vector search), `hybrid` (reciprocal rank fusion) | `lexical` |
+| `--precision` | `binary` (Hamming distance), `int8`, `float` (cosine similarity) | `binary` |
+| `--rerank` | `none`, `binary`, `int8`, `float`: second-stage rerank of the candidates | `none` |
+| `-k`, `--top-k` | passages per answer | 5 |
+| `--rerank-depth`, `--candidate-limit` | candidates that are reranked, or fused per ranking | 1000 |
+
+Runs are named like the run files of scrydb-eval: `bm25`, `bm25-cosine_float`, `hamming`,
+`hamming-cosine_float`, `rrf-cosine_int8`, and so on.
+
+- **Query embeddings.** The queries of a benchmark are searched with their stored embeddings, so
+  the retrieval reproduces the published runs exactly: the nDCG@10 of BM25, BM25 >> cos_float,
+  Hamming, Hamming >> cos_float, cos_float, and RRF(Hamming) on NFCorpus and SciFact, and of
+  cos_float on ArguAna, match the results table of scrydb-eval. Other questions are embedded with
+  Qwen3-Embedding-8B on the platform, with the instruction the stored query embeddings were
+  computed with (`Instruct: <task of the dataset>\nQuery:<question>`; `--task` changes it).
+  Without the instruction, the cosine similarity to the stored embedding of the same query drops
+  from 0.9999 to 0.84–0.93 (for a sample of NFCorpus and SciFact queries).
+- **Self-matches.** As in BEIR (and scrydb-eval), a document with the ID of the query is removed
+  from its results (ArguAna draws its queries from the corpus); `--keep-self-matches` keeps it.
+- **Semantic rerank.** scrydb reranks only the first-stage results it returns, so all
+  `--rerank-depth` candidates are requested and cut to k after the rerank.
+- **Single candidates.** sqlite-vec 0.1.9 finds nothing when a KNN query is restricted to a single
+  rowid, so scrydb's rerank loses the only candidate of a first stage with one result (e.g., the
+  NFCorpus queries "bagels", "lard", and "rickets" with BM25 >> cos_float). The pipeline then uses
+  the first-stage result, which is what the rerank should return.
+
+### Generation
+
+GPT-OSS 120B (`-m` selects another model) gets the passages numbered and cut after
+`--max-passage-chars` (4000) characters, with instructions to answer only from them, to cite
+them as `[n]`, and to say when they do not suffice. The request can also be a claim (SciFact), an
+argument (ArguAna), or a topic, which the instructions cover; `-s` replaces them.
+
+### Interactive mode
+
+`scrydb-rag repl DATASET` answers each question from the passages retrieved for it, streams the
+answer, and lists the cited passages. Commands:
+
+| Command | |
+| :-- | :-- |
+| `/mode`, `/precision`, `/rerank`, `/k` | show or change the retrieval |
+| `/passages on` | list the retrieved passages before each answer |
+| `/show N` | print passage N of the last answer as the model saw it |
+| `/model`, `/models`, `/set KEY VALUE` | change the model or the request parameters |
+| `/reasoning on`, `/usage on` | show the reasoning of the model, or the token usage |
+
+### Benchmark
+
+`scrydb-rag bench DATASET` answers every query in the qrels of a split (`--split test` by default;
+the indices also store the training queries). The results go to
+`results/DATASET/METHOD-kN-MODEL/` (`-o` changes it):
+
+| File | Content |
+| :-- | :-- |
+| `config.json` | settings of the run |
+| `answers.jsonl` | per query: its text, the ranking (top max(k, 10) documents), the passages given to the model (`retrieval_context`), the answer, the reasoning, and the token usage |
+| `run.trec` | the ranking as TREC run file |
+| `retrieval.json` | nDCG@10, nDCG@k, RR@10, P@k, and R@k with the qrels (queries without results count as 0) |
+
+Answers are generated by three concurrent requests (`--workers`), as the API rejects a fourth
+one per key with status 429. Each answer is saved when it is complete, so an interrupted run is
+resumed by repeating the command, which also retries the queries that failed. A directory only
+takes runs with the same settings.
+
+### Evaluation with DeepEval
+
+`scrydb-rag evaluate RUN_DIR` (or `bench --evaluate`) evaluates the answers with three DeepEval
+metrics that need no reference answers, which the test collections do not have:
+
+- `answer_relevancy`: share of the statements of the answer that address the request
+- `faithfulness`: share of the claims of the answer that the passages support
+- `contextual_relevancy`: share of the statements of the passages that are relevant to the request
+
+The judge is a THKI model (`--judge`, GPT-OSS 120B by default) wrapped as custom DeepEval model
+(`ThkiModel` in `scrydb_rag/evaluation.py`). It asks for replies constrained to the JSON schema
+each metric step expects, and falls back to DeepEval's JSON extraction for models that reject
+schemas. The metrics run with `eval_mode="llm"`, so that no decision goes to another service, and
+DeepEval's telemetry is turned off unless `DEEPEVAL_TELEMETRY_OPT_OUT` is set otherwise.
+
+The results go to `deepeval-JUDGE.jsonl` (score and reason per query and metric) and
+`deepeval-JUDGE.json` (mean score and pass rate per metric, with `--threshold` 0.5) in the run
+directory, so the answers of a run can be compared across judges. An interrupted evaluation is
+resumed by repeating the command, which also retries the metrics that failed. Empty answers are
+reported, not evaluated, as DeepEval would rate them perfectly relevant and faithful.
+
+With k=5, an answer takes about 13 judge requests (3 for answer relevancy, 4 for faithfulness, 6
+for contextual relevancy). With its default reasoning effort and three concurrent requests,
+GPT-OSS took about 40 seconds per answer for the three metrics, which is about 3.5 hours for the
+323 NFCorpus queries; `--judge-param reasoning_effort=low` about halves that.
+
+## Development
+
+```bash
+uv run pytest
+```
+
+The tests run offline, with a toy index and a stand-in for the API client. `thki.py` stays a
+standalone command-line client for the platform; the package reuses its `Client`.

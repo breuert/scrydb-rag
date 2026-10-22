@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# scrydb-rag: datasets downloaded from Hugging Face, local state of DeepEval
+data/
+.deepeval/
+
+thki.py
+.env
+results/*

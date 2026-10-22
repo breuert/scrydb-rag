@@ -1,0 +1,518 @@
+"""Command-line interface of scrydb-rag.
+
+Answers questions with passages that scrydb retrieves from the BEIR indices
+of scrydb-eval (or from any other scrydb index), using the models of the
+KI:connect.nrw platform, and benchmarks the answers to the queries of a test
+collection with the qrels and with DeepEval.
+
+Run ``scrydb-rag --help`` for an overview and examples, and
+``scrydb-rag COMMAND --help`` for the options of a command.
+"""
+
+import argparse
+import os
+import sys
+from dataclasses import asdict
+from pathlib import Path
+from typing import List, Optional
+
+from dotenv import load_dotenv
+from thki import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_EMBED_MODEL,
+    Client,
+    ThkiError,
+    connection_options,
+    generate,
+    parse_param,
+    print_error,
+    print_json,
+    print_stats,
+    report,
+    request_params,
+    resolve_model,
+    warn,
+)
+
+from scrydb_rag import RagError
+from scrydb_rag.benchmark import DEFAULT_WORKERS, BenchmarkResult, default_output_dir, run_benchmark
+from scrydb_rag.datasets import DEFAULT_DATA_DIR, TASKS, Dataset, dataset, download, resolve
+from scrydb_rag.pipeline import MAX_PASSAGE_CHARS, SYSTEM_PROMPT, RAGPipeline
+from scrydb_rag.repl import Repl, print_passages, print_sources
+from scrydb_rag.retrieval import (
+    DEFAULT_CANDIDATE_LIMIT,
+    DEFAULT_RERANK_DEPTH,
+    DEFAULT_TOP_K,
+    MODES,
+    PRECISIONS,
+    RetrievalConfig,
+    Retriever,
+    ThkiEmbedding,
+)
+
+# The keys of evaluation.METRICS and its default threshold: the module is only
+# imported when it is needed, as importing DeepEval takes a while
+METRIC_NAMES = ["answer_relevancy", "faithfulness", "contextual_relevancy"]
+DEFAULT_THRESHOLD = 0.5
+# Long runs share the API's limit of concurrent requests with other clients, so
+# requests rejected with status 429 are retried more often than by thki.py
+RETRIES = 5
+
+EXAMPLES = """\
+examples:
+  scrydb-rag datasets
+  scrydb-rag download nfcorpus scifact
+  scrydb-rag ask nfcorpus "Do statins cause breast cancer?"
+  scrydb-rag ask nfcorpus --mode hybrid --precision float -k 10 "How does fasting affect autophagy?"
+  scrydb-rag repl scifact --mode semantic --rerank float
+  scrydb-rag bench nfcorpus --limit 20
+  scrydb-rag bench scifact --mode semantic --rerank float --evaluate
+  scrydb-rag evaluate results/nfcorpus/bm25-k5-openai-gpt-oss-120b --judge qwen3.5
+
+Datasets are given by name (see 'scrydb-rag datasets') or as path of a scrydb index.
+Models can be given by a unique part of their ID, e.g., "gpt-oss" or "mistral".
+
+environment variables (also read from .env):
+  LLM_API_KEY  API key of the KI:connect.nrw platform (required)
+"""
+
+
+def make_client(args: argparse.Namespace) -> Client:
+    """Create an API client with the connection options given on the command line."""
+    api_key = os.getenv("LLM_API_KEY")
+    if not api_key:
+        raise RagError("LLM_API_KEY is not set (in the environment or in a .env file)")
+    return Client(args.api_base, api_key, args.timeout, RETRIES)
+
+
+def make_pipeline(args: argparse.Namespace, client: Client, found: Dataset) -> RAGPipeline:
+    """Create the RAG pipeline for a dataset with the options given on the command line."""
+    config = RetrievalConfig(
+        mode=args.mode,
+        precision=args.precision,
+        rerank=None if args.rerank == "none" else args.rerank,
+        top_k=args.top_k,
+        rerank_depth=args.rerank_depth,
+        candidate_limit=args.candidate_limit,
+    )
+    embedding = ThkiEmbedding(client, resolve_model(client, args.embed_model), args.task or found.task)
+    return RAGPipeline(
+        Retriever(found.index, config, embedding),
+        client,
+        resolve_model(client, args.model),
+        request_params(args),
+        args.system or SYSTEM_PROMPT,
+        args.max_passage_chars,
+    )
+
+
+def cmd_datasets(args: argparse.Namespace) -> None:
+    """List the datasets on Hugging Face and whether they are downloaded."""
+    width = max(len(name) for name in TASKS)
+    for name in TASKS:
+        found = dataset(name, args.data_dir)
+        if not found.downloaded:
+            print(f"{name:<{width}}  -")
+            continue
+        splits = sorted(path.stem for path in found.qrels_dir.glob("*.trec"))
+        size = found.index.stat().st_size / 1e6
+        print(f"{name:<{width}}  {found.index} ({size:,.0f} MB), qrels: {', '.join(splits) or '-'}")
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    """Download the indices and qrels of datasets."""
+    names = list(TASKS) if "all" in args.datasets else args.datasets
+    for found in download(names, args.data_dir):
+        print(f"{found.name}: {found.index}")
+
+
+def cmd_ask(args: argparse.Namespace) -> None:
+    """Answer a question and print the answer with its sources."""
+    question = " ".join(args.question).strip()
+    if not question:
+        raise RagError("no question given")
+    client = make_client(args)
+    pipeline = make_pipeline(args, client, resolve(args.dataset, args.data_dir))
+    passages = pipeline.retriever.search(question)
+    context = pipeline.context(passages)
+    if args.json:
+        reply = pipeline.generate(question, context)
+        print_json(
+            {
+                "query": question,
+                "passages": [{**asdict(passage), "text": text} for passage, text in zip(passages, context)],
+                "answer": reply.content,
+                "reasoning": reply.reasoning,
+                "model": reply.model,
+                "finish_reason": reply.finish_reason,
+                "usage": reply.usage,
+            }
+        )
+        return
+    if args.passages:
+        print_passages(passages)
+    messages = pipeline.messages(question, context)
+    reply = generate(client, pipeline.model, messages, pipeline.params, not args.no_stream, args.reasoning)
+    report(reply, args.usage)
+    print_sources(reply.content, passages)
+    if reply.interrupted:
+        sys.exit(130)
+
+
+def cmd_repl(args: argparse.Namespace) -> None:
+    """Answer questions interactively."""
+    found = resolve(args.dataset, args.data_dir)
+    pipeline = make_pipeline(args, make_client(args), found)
+    Repl(pipeline, found.name, not args.no_stream, args.passages, args.reasoning, args.usage).run()
+
+
+def cmd_bench(args: argparse.Namespace) -> None:
+    """Answer the queries of a test collection and evaluate the answers."""
+    client = make_client(args)
+    found = resolve(args.dataset, args.data_dir)
+    qrels = args.qrels or found.qrels(args.split)
+    pipeline = make_pipeline(args, client, found)
+    output_dir = args.output_dir or default_output_dir(found.name, pipeline)
+    result = run_benchmark(
+        pipeline, found.name, qrels, output_dir, args.split, args.limit, args.workers, not args.keep_self_matches
+    )
+    print_benchmark(result)
+    if args.evaluate:
+        evaluate(args, client, output_dir, [record["qid"] for record in result.records])
+
+
+def cmd_evaluate(args: argparse.Namespace) -> None:
+    """Evaluate the answers of a benchmark run with DeepEval."""
+    evaluate(args, make_client(args), args.run_dir)
+
+
+def evaluate(args: argparse.Namespace, client: Client, run_dir: Path, query_ids: Optional[List[str]] = None) -> None:
+    """Evaluate the answers in a directory with DeepEval and print the results."""
+    from scrydb_rag.evaluation import ThkiModel, run_evaluation
+
+    judge = ThkiModel(client, resolve_model(client, args.judge), dict(args.judge_param), args.workers)
+    result = run_evaluation(run_dir, judge, args.metrics, args.threshold, args.limit, query_ids)
+    if result.empty:
+        warn(f"{len(result.empty)} empty answers were not evaluated (e.g., of query {result.empty[0]})")
+    summary_path = result.results_path.with_suffix(".json")
+    print(f"\nDeepEval, judged by {result.judge} (threshold {args.threshold:g}) -> {summary_path}")
+    width = max(len(name) for name in result.summary)
+    print(f"{'METRIC':<{width}}  {'MEAN':>6}  {'PASSED':>6}  EVALUATED")
+    for name, values in result.summary.items():
+        if values["evaluated"]:
+            line = f"{name:<{width}}  {values['mean']:6.3f}  {values['pass_rate']:6.1%}  {values['evaluated']}"
+        else:
+            line = f"{name:<{width}}  {'-':>6}  {'-':>6}  0"
+        if values["missing"]:
+            line += f" ({values['missing']} failed, repeat the command to retry them)"
+        print(line)
+
+
+def print_benchmark(result: BenchmarkResult) -> None:
+    """Print the outcome of a benchmark run."""
+    if result.skipped:
+        warn(f"{len(result.skipped)} queries of the qrels are not stored in the index (e.g., {result.skipped[0]})")
+    for query_id, message in list(result.failed.items())[:3]:
+        print_error(f"query {query_id}: {message}")
+    if result.failed:
+        warn(f"{len(result.failed)} queries could not be answered (repeat the command to retry them)")
+    records = result.records
+    print(f"\n{len(records)} answers -> {result.output_dir}")
+    if not records:
+        return
+    cut_off = sum(record["finish_reason"] == "length" for record in records)
+    empty = sum(not record["answer"].strip() for record in records)
+    prompt_tokens = sum(record["usage"].get("prompt_tokens") or 0 for record in records)
+    completion_tokens = sum(record["usage"].get("completion_tokens") or 0 for record in records)
+    print_stats(
+        f"{sum(record['seconds'] for record in records) / len(records):.1f} s per answer",
+        f"{prompt_tokens:,} prompt + {completion_tokens:,} completion tokens",
+        f"{cut_off} cut off at the token limit",
+        f"{empty} empty",
+    )
+    print("retrieval: " + " · ".join(f"{name} {value:.4f}" for name, value in result.effectiveness.items()))
+
+
+def data_options() -> argparse.ArgumentParser:
+    """Return a parser with the option for the location of the datasets."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        metavar="DIR",
+        help="directory of the downloaded datasets (default: %(default)s)",
+    )
+    return parser
+
+
+def retrieval_options() -> argparse.ArgumentParser:
+    """Return a parser with the dataset argument and the options for retrieving passages."""
+    parser = argparse.ArgumentParser(add_help=False, parents=[data_options()])
+    parser.add_argument("dataset", metavar="DATASET", help="name of a dataset, or path of a scrydb index")
+    group = parser.add_argument_group("retrieval options")
+    group.add_argument(
+        "--mode",
+        choices=MODES,
+        default="lexical",
+        help="lexical (BM25 over FTS5), semantic (vector search), or hybrid (reciprocal rank fusion "
+        "of both) (default: %(default)s)",
+    )
+    group.add_argument(
+        "--precision",
+        choices=PRECISIONS,
+        default="binary",
+        help="vector precision of semantic search: binary (Hamming distance), int8, or float (cosine "
+        "similarity) (default: %(default)s)",
+    )
+    group.add_argument(
+        "--rerank",
+        choices=("none", *PRECISIONS),
+        default="none",
+        help="precision of a second-stage rerank of the candidates (default: %(default)s)",
+    )
+    group.add_argument(
+        "-k", "--top-k", type=int, default=DEFAULT_TOP_K, metavar="N", help="passages per answer (default: %(default)s)"
+    )
+    group.add_argument(
+        "--rerank-depth",
+        type=int,
+        default=DEFAULT_RERANK_DEPTH,
+        metavar="N",
+        help="number of first-stage candidates that are reranked (default: %(default)s)",
+    )
+    group.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=DEFAULT_CANDIDATE_LIMIT,
+        metavar="N",
+        help="number of candidates of each ranking that hybrid search fuses (default: %(default)s)",
+    )
+    group.add_argument(
+        "--embed-model",
+        default=DEFAULT_EMBED_MODEL,
+        help="model that embeds questions for semantic search, or a unique part of its ID "
+        "(default: %(default)s)",
+    )
+    group.add_argument(
+        "--task",
+        help="instruction for embedding questions (default: the one of the stored query embeddings of the dataset)",
+    )
+    return parser
+
+
+def generation_options(interactive: bool) -> argparse.ArgumentParser:
+    """Return a parser with the options for generating answers (as far as they make sense for a command)."""
+    parser = argparse.ArgumentParser(add_help=False)
+    group = parser.add_argument_group("generation options")
+    group.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_CHAT_MODEL,
+        help="model that generates the answers, or a unique part of its ID (default: %(default)s)",
+    )
+    group.add_argument("-s", "--system", help="system prompt (default: instructions for answering with the passages)")
+    group.add_argument("-t", "--temperature", type=float, help="sampling temperature")
+    group.add_argument(
+        "--max-tokens", type=int, metavar="N", help="maximum number of tokens to generate, including reasoning"
+    )
+    group.add_argument(
+        "-p",
+        "--param",
+        type=parse_param,
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="additional request parameter, VALUE is parsed as JSON if possible "
+        "(e.g., -p reasoning_effort=low); can be repeated",
+    )
+    group.add_argument(
+        "--max-passage-chars",
+        type=int,
+        default=MAX_PASSAGE_CHARS,
+        metavar="N",
+        help="number of characters after which passages are cut (default: %(default)s)",
+    )
+    if interactive:
+        output = parser.add_argument_group("output options")
+        output.add_argument(
+            "--passages", action="store_true", help="list the retrieved passages before the answer"
+        )
+        output.add_argument(
+            "-r", "--reasoning", action="store_true", help="print the reasoning of the model (to stderr)"
+        )
+        output.add_argument(
+            "-u", "--usage", action="store_true", help="print the token usage and timing (to stderr)"
+        )
+        output.add_argument(
+            "--no-stream",
+            action="store_true",
+            help="print answers once they are complete instead of while they are generated",
+        )
+    return parser
+
+
+def evaluation_options() -> argparse.ArgumentParser:
+    """Return a parser with the options for evaluating answers with DeepEval."""
+    parser = argparse.ArgumentParser(add_help=False)
+    group = parser.add_argument_group("evaluation options")
+    group.add_argument(
+        "--judge",
+        default=DEFAULT_CHAT_MODEL,
+        help="model that judges the answers, or a unique part of its ID (default: %(default)s)",
+    )
+    group.add_argument(
+        "--judge-param",
+        type=parse_param,
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="additional request parameter of the judge (e.g., --judge-param reasoning_effort=low); "
+        "can be repeated",
+    )
+    group.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=METRIC_NAMES,
+        default=METRIC_NAMES,
+        metavar="METRIC",
+        help=f"DeepEval metrics: {', '.join(METRIC_NAMES)} (default: all)",
+    )
+    group.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help="score from which on an answer passes a metric (default: %(default)s)",
+    )
+    return parser
+
+
+def workers_option() -> argparse.ArgumentParser:
+    """Return a parser with the option for the number of concurrent requests."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        metavar="N",
+        help="number of concurrent requests; the API rejects more than 3 per key (default: %(default)s)",
+    )
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the parser of the command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="scrydb-rag",
+        description="Retrieval-augmented generation over scrydb indices with the models of the "
+        "KI:connect.nrw platform.",
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    datasets = commands.add_parser(
+        "datasets",
+        parents=[data_options()],
+        help="list the datasets and whether they are downloaded",
+        description="List the BEIR datasets indexed with scrydb on Hugging Face (breuert/scrydb-eval) "
+        "and whether they are downloaded.",
+    )
+    datasets.set_defaults(func=cmd_datasets)
+
+    download_parser = commands.add_parser(
+        "download",
+        parents=[data_options()],
+        help="download the indices and qrels of datasets",
+        description="Download the scrydb indices and qrels of datasets from Hugging Face. Interrupted "
+        "downloads are resumed.",
+    )
+    download_parser.add_argument(
+        "datasets", nargs="+", choices=[*TASKS, "all"], metavar="DATASET", help=f"{', '.join(TASKS)}, or all"
+    )
+    download_parser.set_defaults(func=cmd_download)
+
+    ask = commands.add_parser(
+        "ask",
+        parents=[retrieval_options(), generation_options(interactive=True), connection_options()],
+        help="answer a question",
+        description="Answer a question with passages retrieved from a dataset, and list the cited ones.",
+    )
+    ask.add_argument("question", nargs="+", metavar="QUESTION", help="question to answer")
+    ask.add_argument("--json", action="store_true", help="print the passages and the answer as JSON")
+    ask.set_defaults(func=cmd_ask)
+
+    repl = commands.add_parser(
+        "repl",
+        aliases=["interactive"],
+        parents=[retrieval_options(), generation_options(interactive=True), connection_options()],
+        help="answer questions interactively",
+        description="Answer questions interactively, with passages retrieved from a dataset. "
+        "Type /help in the prompt to see its commands.",
+    )
+    repl.set_defaults(func=cmd_repl)
+
+    bench = commands.add_parser(
+        "bench",
+        parents=[
+            retrieval_options(),
+            generation_options(interactive=False),
+            evaluation_options(),
+            workers_option(),
+            connection_options(),
+        ],
+        help="answer the queries of a test collection and evaluate the answers",
+        description="Answer the queries in the qrels of a split, keep the answers in an output directory, "
+        "and evaluate the retrieval with the qrels (and, with --evaluate, the answers with DeepEval). "
+        "An interrupted run is resumed by repeating the command.",
+    )
+    bench.add_argument("--split", default="test", help="split of the qrels (default: %(default)s)")
+    bench.add_argument("--qrels", type=Path, metavar="FILE", help="qrels file (default: the one of the split)")
+    bench.add_argument("--limit", type=int, metavar="N", help="answer only the first N queries")
+    bench.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        metavar="DIR",
+        help="directory of the run (default: results/DATASET/METHOD-kN-MODEL)",
+    )
+    bench.add_argument(
+        "--keep-self-matches",
+        action="store_true",
+        help="keep documents with the ID of the query in its results (which BEIR removes)",
+    )
+    bench.add_argument("--evaluate", action="store_true", help="evaluate the answers with DeepEval afterwards")
+    bench.set_defaults(func=cmd_bench)
+
+    evaluate_parser = commands.add_parser(
+        "evaluate",
+        parents=[evaluation_options(), workers_option(), connection_options()],
+        help="evaluate the answers of a benchmark run with DeepEval",
+        description="Evaluate the answers of a benchmark run with DeepEval metrics, judged by a model of "
+        "the platform. An interrupted evaluation is resumed by repeating the command.",
+    )
+    evaluate_parser.add_argument("run_dir", type=Path, metavar="RUN_DIR", help="directory of a benchmark run")
+    evaluate_parser.add_argument("--limit", type=int, metavar="N", help="evaluate only the first N answers")
+    evaluate_parser.set_defaults(func=cmd_evaluate)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """Run the command given by the command-line arguments."""
+    load_dotenv()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return
+    try:
+        args.func(args)
+    except ThkiError as e:
+        print_error(str(e))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # The output was closed early (e.g., by head); prevent another error at exit
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrydb-rag"
+version = "0.1.0"
+description = "Retrieval-augmented generation over scrydb indices with the models of the KI:connect.nrw platform."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "scrydb>=0.2.0",
+    "requests>=2.28",
+    "python-dotenv>=1.0",
+    "huggingface_hub>=0.23",
+    "deepeval>=3.0",
+    "ir-measures>=0.3",
+    "numpy>=1.22",
+    "tqdm>=4.60",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[project.scripts]
+scrydb-rag = "scrydb_rag.cli:main"
+
+[tool.setuptools]
+packages = ["scrydb_rag"]
+# thki.py stays a standalone script at the repository root; installing it as a
+# module lets the package reuse its API client.
+py-modules = ["thki"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# DeepEval's plugin manages its own test runs, which these tests are not
+addopts = "-p no:deepeval"
