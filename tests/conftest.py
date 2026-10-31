@@ -1,4 +1,4 @@
-"""Fixtures: a toy scrydb index and a stand-in for the THKI API client."""
+"""Fixtures: a toy scrydb index and a stand-in for the API client."""
 
 import threading
 from pathlib import Path
@@ -8,8 +8,9 @@ import pytest
 import scrydb
 
 from scrydb_rag.pipeline import RAGPipeline
-from scrydb_rag.retrieval import RetrievalConfig, Retriever, ThkiEmbedding
+from scrydb_rag.retrieval import ApiEmbedding, RetrievalConfig, Retriever
 
+EMBED_MODEL = "qwen-qwen3-embedding-8b"
 # Each keyword is one dimension of the toy embeddings
 KEYWORDS = ["statin", "vitamin", "coffee", "bagel", "liver", "good", "fracture", "cancer"]
 
@@ -49,6 +50,7 @@ class FakeClient:
     """
 
     def __init__(self, reply: Callable[[List[Dict[str, Any]], Dict[str, Any]], str] = default_reply):
+        self.api_base = "https://chat.kiconnect.nrw/api/v1"
         self.reply = reply
         self.chat_requests: List[Dict[str, Any]] = []
         self.embedded: List[str] = []
@@ -107,6 +109,6 @@ def client() -> FakeClient:
 
 @pytest.fixture
 def pipeline(toy_index: Path, client: FakeClient) -> RAGPipeline:
-    retriever = Retriever(toy_index, RetrievalConfig(top_k=2), ThkiEmbedding(client, task="Find documents"))
+    retriever = Retriever(toy_index, RetrievalConfig(top_k=2), ApiEmbedding(client, EMBED_MODEL, "Find documents"))
     yield RAGPipeline(retriever, client, "openai-gpt-oss-120b")
     retriever.close()

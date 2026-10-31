@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scrydb-rag"
 version = "0.1.0"
-description = "Retrieval-augmented generation over scrydb indices with the models of the KI:connect.nrw platform."
+description = "Retrieval-augmented generation over scrydb indices with the models of an OpenAI-compatible API (e.g., KI:connect.nrw or OpenRouter)."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

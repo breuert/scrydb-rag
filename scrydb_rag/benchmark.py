@@ -25,7 +25,7 @@ from ir_measures import RR, P, R, ScoredDoc, nDCG
 from thki import Reply, ThkiError
 from tqdm import tqdm
 
-from scrydb_rag import RagError
+from scrydb_rag import ContextError, RagError
 from scrydb_rag.pipeline import RAGPipeline
 from scrydb_rag.retrieval import Passage
 
@@ -34,7 +34,7 @@ ANSWERS_FILE = "answers.jsonl"
 RUN_FILE = "run.trec"
 RETRIEVAL_FILE = "retrieval.json"
 DEFAULT_RESULTS_DIR = Path("results")
-# The API answers more concurrent requests with status 429
+# KI:connect.nrw answers more concurrent requests per key with status 429
 DEFAULT_WORKERS = 3
 # Documents per query in the run file; at least 10, so that nDCG@10 can be
 # compared with the results of scrydb-eval
@@ -75,8 +75,12 @@ def qrels_query_ids(path: Path) -> List[str]:
 
 
 def slug(name: str) -> str:
-    """Return a name that can be part of a file name (e.g., of a model ID)."""
-    return "".join(char if char.isalnum() or char in "._-" else "-" for char in name)
+    """Return a name that can be part of a file name (e.g., of a model ID).
+
+    The slash of model IDs like "openai/gpt-oss-120b" (OpenRouter) becomes
+    "__", so that they differ from IDs like "openai-gpt-oss-120b" (KI:connect.nrw).
+    """
+    return "".join(char if char.isalnum() or char in "._-" else "-" for char in name.replace("/", "__"))
 
 
 def default_output_dir(dataset: str, pipeline: RAGPipeline) -> Path:
@@ -99,6 +103,7 @@ def run_settings(pipeline: RAGPipeline, dataset: str, split: str, exclude_self: 
         "rerank_depth": config.rerank_depth,
         "candidate_limit": config.candidate_limit,
         "exclude_self_matches": exclude_self,
+        "api_base": pipeline.client.api_base,
         "model": pipeline.model,
         "params": pipeline.params,
         "system_prompt": pipeline.system_prompt,
@@ -116,7 +121,8 @@ def check_settings(path: Path, settings: Dict[str, Any]) -> None:
         path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return
     previous = json.loads(path.read_text(encoding="utf-8"))
-    changed = [key for key in dict.fromkeys([*previous, *settings]) if previous.get(key) != settings.get(key)]
+    # Settings that earlier versions did not record (e.g., api_base) are not checked for their runs
+    changed = [key for key in previous if previous[key] != settings.get(key)]
     if changed:
         raise RagError(
             f"{path.parent} holds a run with other settings ({', '.join(changed)}); "
@@ -194,6 +200,7 @@ def run_benchmark(
 
     Raises:
         RagError: If the output directory holds a run with other settings
+        ContextError: If a prompt did not fit into the context of the model
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     check_settings(output_dir / CONFIG_FILE, run_settings(pipeline, dataset, split, exclude_self))
@@ -224,6 +231,8 @@ def run_benchmark(
                     query_id, query, context = futures[future]
                     try:
                         reply = future.result()
+                    except ContextError:
+                        raise  # the context is too small, likely for the other prompts as well
                     except ThkiError as e:
                         failed[query_id] = str(e)
                         continue

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import threading
 import time
 
@@ -7,9 +8,9 @@ import pytest
 from pydantic import BaseModel
 from thki import APIError
 
-from scrydb_rag import RagError, cli, evaluation
+from scrydb_rag import ContextError, RagError, cli, evaluation
 from scrydb_rag.benchmark import ANSWERS_FILE, read_jsonl
-from scrydb_rag.evaluation import METRICS, ThkiModel, run_evaluation
+from scrydb_rag.evaluation import METRICS, JudgeModel, run_evaluation
 
 from conftest import FakeClient
 
@@ -29,7 +30,7 @@ def test_metric_names_of_the_cli_match():
 
 def test_judge_requests_the_schema_and_returns_an_instance():
     client = FakeClient(lambda messages, params: '{"verdict": "yes"}')
-    judge = ThkiModel(client, "openai-gpt-oss-120b", {"reasoning_effort": "low"})
+    judge = JudgeModel(client, "openai-gpt-oss-120b", {"reasoning_effort": "low"})
     assert judge.generate("Is it?", schema=Verdict) == Verdict(verdict="yes")
     params = client.chat_requests[0]["params"]
     assert schema_name(params) == "Verdict"
@@ -40,7 +41,7 @@ def test_judge_requests_the_schema_and_returns_an_instance():
 
 
 def test_judge_returns_text_that_does_not_fit_the_schema():
-    judge = ThkiModel(FakeClient(lambda messages, params: 'Sure! {"verdict": "yes"}'))
+    judge = JudgeModel(FakeClient(lambda messages, params: 'Sure! {"verdict": "yes"}'), "openai-gpt-oss-120b")
     assert judge.generate("Is it?", schema=Verdict) == 'Sure! {"verdict": "yes"}'
 
 
@@ -51,7 +52,7 @@ def test_judge_does_without_schemas_if_the_model_rejects_them():
         return '{"verdict": "no"}'
 
     client = FakeClient(reply)
-    judge = ThkiModel(client)
+    judge = JudgeModel(client, "openai-gpt-oss-120b")
     assert judge.generate("Is it?", schema=Verdict) == Verdict(verdict="no")
     assert not judge.structured_outputs
     judge.generate("Is it?", schema=Verdict)
@@ -62,7 +63,7 @@ def test_judge_keeps_schemas_if_the_request_itself_fails():
     def reply(messages, params):
         raise APIError("400 the prompt is too long", 400)
 
-    judge = ThkiModel(FakeClient(reply))
+    judge = JudgeModel(FakeClient(reply), "openai-gpt-oss-120b")
     with pytest.raises(APIError):
         judge.generate("Is it?", schema=Verdict)
     assert judge.structured_outputs
@@ -80,7 +81,7 @@ def test_judge_limits_concurrent_requests():
             active[0] -= 1
         return "ok"
 
-    judge = ThkiModel(FakeClient(slow_reply), max_concurrency=2)
+    judge = JudgeModel(FakeClient(slow_reply), "openai-gpt-oss-120b", max_concurrency=2)
 
     async def ask_many():
         return await asyncio.gather(*[judge.a_generate(f"prompt {i}") for i in range(8)])
@@ -117,7 +118,7 @@ def answer(query_id, text="Statins do not cause breast cancer [1]. The weather i
 
 def test_deepeval_metric_with_the_judge(tmp_path):
     write_answers(tmp_path, [answer("q1")])
-    judge = ThkiModel(FakeClient(answer_relevancy_judge), "openai-gpt-oss-120b")
+    judge = JudgeModel(FakeClient(answer_relevancy_judge), "openai-gpt-oss-120b")
     result = run_evaluation(tmp_path, judge, ["answer_relevancy"])
     assert result.summary["answer_relevancy"] == {"mean": 0.5, "pass_rate": 1.0, "evaluated": 1, "missing": 0}
     [record] = read_jsonl(result.results_path)
@@ -149,7 +150,7 @@ def test_evaluation_is_resumed_and_retries_failures(tmp_path, monkeypatch):
     monkeypatch.setitem(METRICS, "answer_relevancy", FakeMetric)
     FakeMetric.calls, FakeMetric.fail = [], True
     write_answers(tmp_path, [answer("q1"), answer("q2"), answer("q3", text="  ")])
-    judge = ThkiModel(FakeClient())
+    judge = JudgeModel(FakeClient(), "openai-gpt-oss-120b")
 
     result = run_evaluation(tmp_path, judge, ["answer_relevancy"])
     assert sorted(FakeMetric.calls) == ["q1", "q2"]
@@ -170,6 +171,23 @@ def test_evaluation_is_resumed_and_retries_failures(tmp_path, monkeypatch):
     assert result.summary["answer_relevancy"]["evaluated"] == 1
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "the prompt did not fit into the context of qwen3:8b (4,096 tokens)",
+        "maximum context length exceeded",  # DeepEval wraps errors with this phrase in its own
+    ],
+)
+def test_evaluation_stops_if_a_prompt_does_not_fit_into_the_context_of_the_judge(tmp_path, message):
+    def too_long(messages, params):
+        raise ContextError(message)
+
+    write_answers(tmp_path, [answer("q1")])
+    with pytest.raises(ContextError, match=re.escape(message)):
+        run_evaluation(tmp_path, JudgeModel(FakeClient(too_long), "qwen3:8b"), ["answer_relevancy"])
+    assert read_jsonl(tmp_path / "deepeval-qwen3-8b.jsonl") == []
+
+
 def test_evaluation_needs_answers(tmp_path):
     with pytest.raises(RagError, match="no answers"):
-        run_evaluation(tmp_path, ThkiModel(FakeClient()))
+        run_evaluation(tmp_path, JudgeModel(FakeClient(), "openai-gpt-oss-120b"))

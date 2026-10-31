@@ -1,7 +1,7 @@
-"""Evaluation of benchmark answers with DeepEval, judged by models of the THKI platform.
+"""Evaluation of benchmark answers with DeepEval, judged by chat models of an OpenAI-compatible API.
 
-The judge is a custom DeepEval model (``ThkiModel``) that sends the prompts
-of DeepEval's metrics to a chat model of the platform. The metrics need no
+The judge is a custom DeepEval model (``JudgeModel``) that sends the prompts
+of DeepEval's metrics to a chat model of the API. The metrics need no
 reference answers, which the test collections do not have:
 
     answer_relevancy      Do the statements of the answer address the request?
@@ -39,10 +39,10 @@ from deepeval.metrics import (  # noqa: E402
 from deepeval.models import DeepEvalBaseLLM  # noqa: E402
 from deepeval.test_case import LLMTestCase  # noqa: E402
 from pydantic import BaseModel, ValidationError  # noqa: E402
-from thki import DEFAULT_CHAT_MODEL, APIError, Client  # noqa: E402
+from thki import APIError, Client  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
-from scrydb_rag import RagError  # noqa: E402
+from scrydb_rag import ContextError, RagError  # noqa: E402
 from scrydb_rag.benchmark import ANSWERS_FILE, DEFAULT_WORKERS, read_jsonl, slug  # noqa: E402
 
 METRICS: Dict[str, Type[BaseMetric]] = {
@@ -53,18 +53,18 @@ METRICS: Dict[str, Type[BaseMetric]] = {
 DEFAULT_THRESHOLD = 0.5
 
 
-class ThkiModel(DeepEvalBaseLLM):
-    """Chat model of the THKI platform as judge of DeepEval's metrics.
+class JudgeModel(DeepEvalBaseLLM):
+    """Chat model of an OpenAI-compatible API as judge of DeepEval's metrics.
 
     Asks for replies that are constrained to the JSON schema that a metric
-    expects, and limits the number of concurrent requests, as the API answers
+    expects, and limits the number of concurrent requests, as APIs answer
     too many of them with status 429.
     """
 
     def __init__(
         self,
         client: Client,
-        model: str = DEFAULT_CHAT_MODEL,
+        model: str,
         params: Optional[Dict[str, Any]] = None,
         max_concurrency: int = DEFAULT_WORKERS,
     ):
@@ -164,13 +164,16 @@ def make_test_case(record: Dict[str, Any]) -> LLMTestCase:
     )
 
 
-async def measure(record: Dict[str, Any], name: str, judge: ThkiModel, threshold: float) -> Dict[str, Any]:
+async def measure(record: Dict[str, Any], name: str, judge: JudgeModel, threshold: float) -> Dict[str, Any]:
     """Evaluate an answer with a metric and return the result as record."""
     metric = METRICS[name](model=judge, threshold=threshold, include_reason=True, async_mode=True, eval_mode="llm")
     result = {"qid": record["qid"], "metric": name, "judge": judge.get_model_name()}
     try:
         await metric.a_measure(make_test_case(record), _show_indicator=False)
     except Exception as e:  # e.g., a reply of the judge that is not valid JSON
+        cause = e if isinstance(e, ContextError) else e.__cause__  # DeepEval may wrap it
+        if isinstance(cause, ContextError):
+            raise cause  # the context is too small, likely for the other prompts as well
         return {**result, "score": None, "reason": None, "error": f"{type(e).__name__}: {e}"}
     if metric.score is None:
         return {**result, "score": None, "reason": None, "error": metric.error or "no score"}
@@ -178,7 +181,7 @@ async def measure(record: Dict[str, Any], name: str, judge: ThkiModel, threshold
 
 
 async def measure_all(
-    tasks: List[Tuple[Dict[str, Any], str]], judge: ThkiModel, threshold: float, results_path: Path
+    tasks: List[Tuple[Dict[str, Any], str]], judge: JudgeModel, threshold: float, results_path: Path
 ) -> None:
     """Evaluate answers with metrics and append the results to a file as they are available."""
     # Twice as many metrics as requests are in progress, so that one is ready
@@ -215,7 +218,7 @@ def summarize(
 
 def run_evaluation(
     run_dir: Path,
-    judge: ThkiModel,
+    judge: JudgeModel,
     metrics: Optional[List[str]] = None,
     threshold: float = DEFAULT_THRESHOLD,
     limit: Optional[int] = None,
@@ -233,6 +236,7 @@ def run_evaluation(
 
     Raises:
         RagError: If the directory holds no answers
+        ContextError: If a prompt did not fit into the context of the judge
     """
     metrics = metrics or list(METRICS)
     records = read_jsonl(run_dir / ANSWERS_FILE)

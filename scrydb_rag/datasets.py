@@ -47,7 +47,7 @@ class Dataset:
     Attributes:
         name: Name of the dataset (e.g., "nfcorpus")
         index: Path of the scrydb index
-        task: Instruction for embedding queries (see ``ThkiEmbedding``)
+        task: Instruction for embedding queries (see ``ApiEmbedding``)
         qrels_dir: Directory with the qrels of the splits as <split>.trec
     """
 

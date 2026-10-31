@@ -2,7 +2,9 @@ import pytest
 
 from scrydb_rag import RagError
 from scrydb_rag.datasets import DEFAULT_TASK, TASKS, Dataset, resolve
-from scrydb_rag.retrieval import RetrievalConfig, Retriever, ThkiEmbedding, stage_score
+from scrydb_rag.retrieval import ApiEmbedding, RetrievalConfig, Retriever, stage_score
+
+from conftest import EMBED_MODEL
 
 
 @pytest.mark.parametrize(
@@ -52,7 +54,7 @@ def test_lexical_search(toy_index):
 
 
 def test_semantic_search_embeds_the_query_with_the_instruction(toy_index, client):
-    embedding = ThkiEmbedding(client, task="Find documents")
+    embedding = ApiEmbedding(client, EMBED_MODEL, "Find documents")
     retriever = Retriever(toy_index, RetrievalConfig("semantic", "float"), embedding)
     passages = retriever.search("Which vitamin prevents fractures?")
     assert passages[0].docid == "d2"
@@ -60,8 +62,19 @@ def test_semantic_search_embeds_the_query_with_the_instruction(toy_index, client
     assert client.embedded == ["Instruct: Find documents\nQuery:Which vitamin prevents fractures?"]
 
 
+@pytest.mark.parametrize(
+    "config",
+    [RetrievalConfig("semantic"), RetrievalConfig("hybrid"), RetrievalConfig("lexical", rerank="float")],
+)
+def test_questions_need_an_embedding_model_unless_searched_lexically(toy_index, config):
+    retriever = Retriever(toy_index, config)
+    with pytest.raises(RagError, match="--embed-model"):
+        retriever.search("Which vitamin prevents fractures?")
+    assert retriever.search_stored(["q1"])["q1"][0].docid == "d1"
+
+
 def test_stored_queries_use_their_stored_embeddings(toy_index, client):
-    retriever = Retriever(toy_index, RetrievalConfig("semantic", "binary", "float"), ThkiEmbedding(client))
+    retriever = Retriever(toy_index, RetrievalConfig("semantic", "binary", "float"), ApiEmbedding(client, EMBED_MODEL))
     rankings = retriever.search_stored(["q1", "q2"])
     assert rankings["q1"][0].docid == "d1"
     assert client.embedded == []
@@ -78,7 +91,7 @@ def test_self_matches_are_excluded(toy_index):
 
 @pytest.mark.parametrize("rerank", ["binary", "int8", "float"])
 def test_rerank_keeps_a_single_candidate(toy_index, client, rerank):
-    retriever = Retriever(toy_index, RetrievalConfig("lexical", rerank=rerank), ThkiEmbedding(client))
+    retriever = Retriever(toy_index, RetrievalConfig("lexical", rerank=rerank), ApiEmbedding(client, EMBED_MODEL))
     assert [passage.docid for passage in retriever.search("bagels")] == ["d4"]
     assert [passage.docid for passage in retriever.search_stored(["q3"])["q3"]] == ["d4"]
 

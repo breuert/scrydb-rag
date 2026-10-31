@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import numpy as np
 import scrydb
-from thki import DEFAULT_EMBED_MODEL, Client, embed_batches
+from thki import Client, embed_batches
 
 from scrydb_rag import RagError
 from scrydb_rag.datasets import DEFAULT_TASK
@@ -34,15 +34,15 @@ SCORE_FIELDS = (
 )
 
 
-class ThkiEmbedding:
-    """Embeds texts with an embedding model of the THKI platform.
+class ApiEmbedding:
+    """Embeds texts with an embedding model of an OpenAI-compatible API.
 
     Has the interface of scrydb's ``SentenceEmbedding``, so it can be attached
     to an index with ``Index.add_model()`` for semantic search with query texts
     that have no stored embedding.
     """
 
-    def __init__(self, client: Client, model: str = DEFAULT_EMBED_MODEL, task: str = DEFAULT_TASK):
+    def __init__(self, client: Client, model: str, task: str = DEFAULT_TASK):
         """Initialize the embedding model.
 
         Args:
@@ -154,18 +154,20 @@ class Retriever:
         self,
         index_path: Path,
         config: RetrievalConfig = RetrievalConfig(),
-        embedding: Optional[ThkiEmbedding] = None,
+        embedding: Optional[ApiEmbedding] = None,
     ):
         """Open the index.
 
         Args:
             index_path: Path of the scrydb index
             config: Retrieval method
-            embedding: Model that embeds query texts for semantic search and reranking
+            embedding: Model that embeds query texts for semantic search and
+                reranking (without one, only lexical search takes query texts)
         """
         if not Path(index_path).is_file():
             raise RagError(f"no scrydb index at {index_path}")
         self.index = scrydb.Index.open(str(index_path))
+        self.embedding = embedding
         if embedding is not None:
             self.index.add_model(embedding)
         self.config = config
@@ -181,6 +183,8 @@ class Retriever:
             depth: Number of passages (default: top_k of the configuration)
         """
         depth = depth or self.config.top_k
+        if self.embedding is None and (self.config.mode != "lexical" or self.config.rerank):
+            raise RagError("no model to embed the question with (see --embed-model)")
         params = self._search_params(depth)
         results = self.index.search(query, **params)
         if not results and params["rerank"]:
